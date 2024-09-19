@@ -27,17 +27,18 @@ class Visualize():
         ax[1].axis('off')
         
         plt.tight_layout()
-        plt.savefig(self.directory + filename)
+        plt.savefig(self.directory + filename, dpi=300)
     
-    def plot_constrained(self, boundedGP, n_samples=3, filename='constrained.png'):
+    def plot_constrained(self, boundedGP, n_samples=100, filename='constrained.png'):
         fig, ax = plt.subplots(1, 2, figsize=(12, 4), width_ratios=[2, 1])
 
         y1, = ax[0].plot(boundedGP.hats.hat_x, boundedGP.mean_constrained)
-        y2, = ax[0].plot(boundedGP.hats.hat_x, boundedGP.mean_interpol)
+        y2, = ax[0].plot(boundedGP.hats.hat_x, boundedGP.mean_interpol, linestyle='--')
         
         y_sample = []
+        samples = boundedGP.sample_constrained(n_samples=n_samples)
         for i in range(n_samples):
-            y_sample.append(ax[0].plot(boundedGP.hats.hat_x, boundedGP.sample_constrained()[0], color='red', linestyle='-', linewidth=0.5, alpha=0.3)[0])
+            y_sample.append(ax[0].plot(boundedGP.hats.hat_x, samples[i], color='red', linestyle='-', linewidth=0.2, alpha=0.1)[0])
         
         ax[0].scatter(boundedGP.interpol_x, boundedGP.interpol_y, marker='x', color='red')
         
@@ -49,4 +50,4 @@ class Visualize():
         ax[1].axis('off')
         
         plt.tight_layout()
-        plt.savefig(self.directory + filename)
+        plt.savefig(self.directory + filename, dpi=300)

@@ -34,6 +34,16 @@ class hats():
             A[:, j] = self.eval_hat(x_j, x_eval)
         return A
 
+def monotonic():
+    def __init__(self, N_splines, x_min, x_max):
+        self.spline_x = np.linspoace(x_min, x_max, N_splines+1)
+        self.dx_spline = self.spline_x[1]-self.spline_x[0]
+        self.n_splines = N_splines+1
+
+    def eval_spline(self, x_spline_, x_sample):
+        return Y
+    
+
 class BoundedGP():
 
     def __init__(self, N_hat, x_min, x_max, k, interpol_x=None, interpol_y=None, lowerbound=None, upperbound=None):
@@ -46,6 +56,10 @@ class BoundedGP():
             for j in range(self.hats.n_splines):
                 self.cov_prior[i, j] = k(self.hats.hat_x[i], self.hats.hat_x[j])
 
+        if np.linalg.cond(self.cov_prior) > 1e6:
+            old_cond = np.linalg.cond(self.cov_prior)
+            self.cov_prior = self.cov_prior + 1e-6*np.eye(self.hats.n_splines)
+            print('[Nugget] added to prior covariance matrix. Condition number went from %d to %d.' % (old_cond, np.linalg.cond(self.cov_prior)))
         self.interpol_x = interpol_x
         self.interpol_y = interpol_y
 
@@ -55,23 +69,29 @@ class BoundedGP():
         if self.interpol_x is not None:
             A = self.hats.eval_hats(interpol_x)
             self.mean_interpol = (A @ self.cov_prior).T @ np.linalg.solve(A @ self.cov_prior @ A.T, interpol_y)
-            print('Cond', np.linalg.cond(np.linalg.inv(A @ self.cov_prior @ A.T)))
             self.cov_interpol  = self.cov_prior - (A @ self.cov_prior).T @ np.linalg.inv(A @ self.cov_prior @ A.T) @ A @ self.cov_prior
-            # why is the condition horrible?
-            print(np.linalg.cond((A @ self.cov_prior).T @ np.linalg.inv(A @ self.cov_prior @ A.T) @ (A @ self.cov_prior)))
+
+            cov_noise = self.cov_interpol + 5e-3 * np.eye(self.hats.n_splines)# np.random.uniform(size=self.cov_interpol.shape)
+
+            print('[Nugget] added to post-interpolation covariance matrix. Condition number went from %d to %d.' % (np.linalg.cond(self.cov_interpol), np.linalg.cond(cov_noise)))
+            print('[PosDef] Post-interpolation matrix:', np.all(np.linalg.eigvals(self.cov_interpol) > 0))
+            print('[PosDef] Post-interpolation covariance matrix with nugget:', np.all(np.linalg.eigvals(cov_noise) > 0))
+            print('[PosDef] Prior covariance matrix:', np.all(np.linalg.eigvals(self.cov_prior) > 0))
+
+            # adding noise does decrease it
+            self.cov_interpol = cov_noise
         self.lowerbound = lowerbound
         self.upperbound = upperbound
 
         if self.lowerbound is not None:
             A = self.hats.eval_hats(interpol_x)
             interpolation_constraint = scipy.optimize.LinearConstraint(A, interpol_y, interpol_y)
-            # why cov_prior and not cov_interpol?
-            # it doesn't matter much, just improves the rejection sampling %
-            # once rejection sampling works see percentage with and without using cov_prior
-            optim_result = scipy.optimize.minimize(lambda x: x.T @ self.cov_interpol @ x, np.zeros_like(self.hats.hat_x), 
+
+            # whether we optimize w.r.t. \Gamma^{N} or \Sigma doesn't matter. The minimum is equal in our case (I believe),
+            # but definitely not in the general case. The prior matrix is better conditioned, so we will use that one here.
+            optim_result = scipy.optimize.minimize(lambda x: (x-self.mean_interpol).T @ np.linalg.solve(self.cov_interpol, (x-self.mean_interpol)), np.zeros_like(self.mean_prior), 
                                                             method='COBYQA', bounds=((lowerbound, upperbound),), 
                                                             constraints=interpolation_constraint)
-            print(optim_result)
             assert optim_result.success, optim_result
             self.mean_constrained = optim_result.x
 
@@ -99,21 +119,27 @@ class BoundedGP():
 
         samples = np.zeros((n_samples, self.hats.n_splines))
 
-        n_accept = 0
-
-        for n_iter in range(10*n_samples):
+        n_accepted = 0
+        n_rejected = 0
+        for n_iter in range(1000*n_samples):
             potential = np.random.multivariate_normal(self.mean_constrained, self.cov_interpol, n_samples)
+
+            accepted_convex = np.logical_and(np.all(potential > self.lowerbound-1e-9, axis=1), np.all(potential < self.upperbound + 1e-9, axis=1))
+            
+            
             unif = np.random.uniform(size=n_samples)
-            # doesn't work. Why would this work?
-            # why are these samples still interpolated?
-            accept = unif < np.exp(self.mean_constrained.T @ np.linalg.inv(self.cov_prior) @ self.mean_constrained - 
-                                   potential @ np.linalg.inv(self.cov_prior) @ self.mean_constrained)
-            n_newly_accepted = min(accept.sum(), n_samples-n_accept)
-            samples[n_accept:n_accept+n_newly_accepted, :] = potential[accept, :][:n_newly_accepted]
+            # Have to use cov_interpol, otherwise Neumann theorem doesn't apply and we can't sample from the original distribution in this way.
+            accepted_neumann_sampling = unif < np.exp(self.mean_constrained.T @ np.linalg.solve(self.cov_interpol, self.mean_constrained) - 
+                                   potential @ np.linalg.solve(self.cov_interpol, self.mean_constrained))
+            accepted = np.logical_and(accepted_convex, accepted_neumann_sampling)
+            n_newly_accepted = min(accepted.sum(), n_samples-n_accepted)
+            samples[n_accepted:n_accepted+n_newly_accepted, :] = potential[accepted, :][:n_newly_accepted]
 
-            n_accept += n_newly_accepted
-
-            print('Accepted: %d; %.2f percent' % (n_newly_accepted, n_newly_accepted/n_samples))
-            if n_accept == n_samples:
+            n_accepted += n_newly_accepted
+            n_rejected += n_samples - n_newly_accepted
+            if n_accepted == n_samples:
                 break
+        print('Accepted: %d; %.2f percent' % (n_accepted, 100.*n_accepted/(n_accepted+n_rejected)))
+
+        assert n_accepted == n_samples
         return samples
