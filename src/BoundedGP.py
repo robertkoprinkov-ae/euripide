@@ -1,6 +1,6 @@
 import numpy as np
 import scipy
-from quadprog import solve_qp
+from qpsolvers import solve_qp
 
 class spline():
     def eval_spline(self, spline_i, x_sample):
@@ -277,18 +277,33 @@ class BoundedGP(constrainedGP):
         if self.lowerbound is not None:
             A = self.splines.eval_splines(interpol_x)
             interpolation_constraint = scipy.optimize.LinearConstraint(A, interpol_y, interpol_y)
+            
+            constraint_matrix = np.zeros((2*(self.splines.n_splines), self.splines.n_splines))
+            constraint_matrix[:self.splines.n_splines, :] = np.eye(self.splines.n_splines)
+            constraint_matrix[self.splines.n_splines:, :] = -np.eye(self.splines.n_splines)
+
+            constraints_max_value = np.zeros(2*(self.splines.n_splines))
+            constraints_max_value[:self.splines.n_splines] = upperbound
+            constraints_max_value[self.splines.n_splines:] = -lowerbound
 
             # whether we optimize w.r.t. \Gamma^{N} or \Sigma doesn't matter. The minimum is equal in our case (I believe),
             # but definitely not in the general case. The prior matrix is better conditioned, so we will use that one here.
-            optim_result = scipy.optimize.minimize(lambda x: (x-self.mean_interpol).T @ np.linalg.solve(self.cov_interpol, (x-self.mean_interpol)), np.zeros_like(self.mean_prior), 
-                                                            method='COBYQA', bounds=((lowerbound, upperbound),), 
-                                                            constraints=interpolation_constraint)
-            optim_prior = scipy.optimize.minimize(lambda x: x.T @ np.linalg.solve(self.cov_prior, x), np.zeros_like(self.mean_interpol), 
-                                                            method='COBYQA', bounds=((lowerbound, upperbound),), 
-                                                            constraints=interpolation_constraint)
-            assert optim_result.success, optim_result
-            self.mean_constrained = optim_result.x
-            self.mean_constrained_prior = optim_prior.x
+            #optim_result_no_bounds = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), constraint_matrix, constraints_max_value, None, None, lb=constraints[:, 0], ub=constraints[:, 1], solver='quadprog', verbose=True)
+            optim_result = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), constraint_matrix, constraints_max_value, None, None, solver='quadprog', verbose=True)
+
+            # in extreme cases, the prior solver works better
+            # for some reason, the posterior one doesn't work in the monotonic case where we have an almost constant stretch
+            # the constraint ends up being violated
+            optim_prior = solve_qp(np.linalg.inv(self.cov_prior), np.zeros(self.splines.n_splines), constraint_matrix, constraints_max_value, A, interpol_y, solver='quadprog', verbose=True)
+            #optim_result = scipy.optimize.minimize(lambda x: (x-self.mean_interpol).T @ np.linalg.solve(self.cov_interpol, (x-self.mean_interpol)), np.zeros_like(self.mean_prior), 
+            #                                                method='COBYQA', bounds=((lowerbound, upperbound),), 
+            #                                                constraints=interpolation_constraint)
+            #optim_prior = scipy.optimize.minimize(lambda x: x.T @ np.linalg.solve(self.cov_prior, x), np.zeros_like(self.mean_interpol), 
+            #                                                method='COBYQA', bounds=((lowerbound, upperbound),), 
+            #                                                constraints=interpolation_constraint)
+            #assert optim_result.success, optim_result
+            self.mean_constrained = optim_result
+            self.mean_constrained_prior = optim_prior
 
     # verify that the below 4 functions give the same output now and before
     #def statistics_prior(self):
@@ -304,10 +319,9 @@ class BoundedGP(constrainedGP):
     #    assert self.mean_interpol is not None and self.cov_interpol is not None
     #    return np.random.multivariate_normal(self.mean_interpol, self.cov_interpol, n_samples).T
 
-    def sample_constrained(self, x_sample=None, n_samples = 1):
+    def sample_constrained(self, x_sample=None, n_samples = 1, return_stats=False, throw_exception_if_failed=True):
         assert self.mean_interpol is not None and self.cov_interpol is not None
         assert self.mean_constrained is not None
-
         phi_T = None
         if x_sample is not None:
             phi_T = self.splines.eval_splines(x_sample)
@@ -315,16 +329,19 @@ class BoundedGP(constrainedGP):
 
         n_accepted = 0
         n_rejected = 0
+        n_rejected_constraint = 0
         for n_iter in range(1000*n_samples):
             potential = np.random.multivariate_normal(self.mean_constrained, self.cov_interpol, n_samples)
 
             accepted_convex = np.logical_and(np.all(potential > self.lowerbound-1e-9, axis=1), np.all(potential < self.upperbound + 1e-9, axis=1))
             
+            n_rejected_constraint += n_samples - accepted_convex.sum()
             
             unif = np.random.uniform(size=n_samples)
             # Have to use cov_interpol, otherwise Neumann theorem doesn't apply and we can't sample from the original distribution in this way.
-            accepted_neumann_sampling = unif < np.exp(self.mean_constrained.T @ np.linalg.solve(self.cov_interpol, self.mean_constrained) - 
-                                   potential @ np.linalg.solve(self.cov_interpol, self.mean_constrained))
+            accepted_neumann_sampling = unif < np.exp((potential-self.mean_constrained.T) @ np.linalg.solve(self.cov_interpol, self.mean_interpol - self.mean_constrained))
+            #accepted_neumann_sampling = unif < np.exp(self.mean_constrained.T @ np.linalg.solve(self.cov_interpol, self.mean_constrained) - 
+            #                       potential @ np.linalg.solve(self.cov_interpol, self.mean_constrained))
             accepted = np.logical_and(accepted_convex, accepted_neumann_sampling)
             n_newly_accepted = min(accepted.sum(), n_samples-n_accepted)
 
@@ -332,14 +349,19 @@ class BoundedGP(constrainedGP):
                 samples[n_accepted:n_accepted+n_newly_accepted, :] = potential[accepted, :][:n_newly_accepted]
             else:
                 samples[n_accepted:n_accepted+n_newly_accepted, :] = potential[accepted, :][:n_newly_accepted] @ phi_T.T                
-            n_accepted += n_newly_accepted
-            n_rejected += n_samples - n_newly_accepted
-            if n_accepted == n_samples:
+            n_accepted += accepted.sum()
+            n_rejected += n_samples - accepted.sum()
+            if n_accepted >= n_samples:
                 break
-        print('Accepted: %d; %.2f percent' % (n_accepted, 100.*n_accepted/(n_accepted+n_rejected)))
+        print('Sampling %.2f%% (accepted); %.2f%% (Rejected, violated constraints); %.2f%% (Rejected, Neumann sampling)' % (100.*n_accepted/(n_accepted+n_rejected),\
+              100*n_rejected_constraint/(n_accepted+n_rejected), 100*(n_rejected-n_rejected_constraint)/(n_accepted+n_rejected)))
+        if throw_exception_if_failed:
+            assert n_accepted >= n_samples
 
-        assert n_accepted == n_samples
-        return samples
+        if return_stats:
+            return samples[:n_accepted, :], {'n_rejected_constraint': n_rejected_constraint, 'n_rejected_neumann': n_rejected-n_rejected_constraint, 'n_accepted': n_accepted}
+        else:
+            return samples[:n_accepted, :]
 
 class MonotonicGP(constrainedGP):
 
@@ -371,7 +393,7 @@ class MonotonicGP(constrainedGP):
 
         self.kernel = kernel
 
-        self.mean_prior, self.cov_prior = self.monotonic_prior(nugget=1e-3)
+        self.mean_prior, self.cov_prior = self.monotonic_prior(nugget=1e-6)
         
         self.interpol_x = interpol_x
         self.interpol_y = interpol_y
@@ -380,48 +402,48 @@ class MonotonicGP(constrainedGP):
         self.cov_interpol = None
         
         if self.interpol_x is not None:
-            self.mean_interpol, self.cov_interpol = self.calc_interpolation(interpol_x, interpol_y, nugget=5e-3)
+            self.mean_interpol, self.cov_interpol = self.calc_interpolation(interpol_x, interpol_y, nugget=1e-6)
 
         A = self.splines.eval_splines(interpol_x)
         interpolation_constraint = scipy.optimize.LinearConstraint(A, interpol_y, interpol_y)
         
         self.lowerbound, self.upperbound = lowerbound, upperbound
 
-        # whether we optimize w.r.t. \Gamma^{N} or \Sigma doesn't matter. The minimum is equal in our case (I believe),
-        # but definitely not in the general case. The prior matrix is better conditioned, so we will use that one here.
         constraints = [[-1e-5, 1e5]] + [[lowerbound, upperbound] for x in range(self.splines.n_splines-1)]
         constraints = np.array(constraints)
-        boundedness_constraint = scipy.optimize.LinearConstraint(np.eye(self.splines.n_splines), constraints[:, 0], constraints[:, 1])
-        optim_result = scipy.optimize.minimize(lambda x: (x-self.mean_interpol).T @ np.linalg.solve(self.cov_interpol, (x-self.mean_interpol)), self.mean_interpol, 
-                                                        method='COBYQA', bounds=((lowerbound, upperbound),), 
-                                                        options={'maxiter': 4000, 'maxfev': 6000}, 
-                                                        constraints=boundedness_constraint)
-        optim_prior = scipy.optimize.minimize(lambda x: x.T @ np.linalg.solve(self.cov_prior, x), self.mean_interpol, 
-                                                        method='COBYQA', bounds=((lowerbound, upperbound),), 
-                                                        constraints=[interpolation_constraint, boundedness_constraint], options={'maxiter': 4000, 'maxfev': 6000})
-        #constraints = [[-100., 100.]] + [[0., 100.] for x in range(self.splines.n_splines-1)]
-        #constraints = np.array(constraints)
-        #boundedness_constraint = scipy.optimize.LinearConstraint(np.eye(self.splines.n_splines), constraints[:, 0], constraints[:, 1])
-        # whether we optimize w.r.t. \Gamma^{N} or \Sigma doesn't matter. The minimum is equal in our case (I believe),
-        # but definitely not in the general case. The prior matrix is better conditioned, so we will use that one here.
-        #optim_result = scipy.optimize.minimize(lambda x: (x-self.mean_interpol).T @ np.linalg.solve(self.cov_interpol, (x-self.mean_interpol)), np.zeros_like(self.mean_prior), 
-        #                                                method='COBYQA', bounds=((-100., 100.),), # the bounds are not completely correct 
-        #                                                constraints=[interpolation_constraint])#, boundedness_constraint])
-        #optim_prior = scipy.optimize.minimize(lambda x: x.T @ np.linalg.solve(self.cov_prior, x), np.zeros_like(self.mean_interpol), 
-        #                                                method='COBYQA', bounds=((lowerbound, upperbound),), 
-        #                                                constraints=interpolation_constraint)
-        print(optim_result, optim_prior)
-        #assert optim_result.success, optim_result
-        self.mean_constrained = optim_result.x
-        self.mean_constrained_prior = optim_prior.x
 
-        print('Optim posterior vs prior difference', np.abs(optim_result.x - optim_prior.x).max())
+        constraint_matrix = np.zeros((2*(self.splines.n_splines-1), self.splines.n_splines))
+        constraint_matrix[:self.splines.n_splines-1, 1:] = np.eye(self.splines.n_splines-1)
+        constraint_matrix[self.splines.n_splines-1:, 1:] = -np.eye(self.splines.n_splines-1)
+
+        constraints_max_value = np.zeros(2*(self.splines.n_splines-1))
+        constraints_max_value[:self.splines.n_splines-1] = upperbound
+        constraints_max_value[self.splines.n_splines-1:] = -lowerbound
+        
+        optim_result_no_bounds = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), constraint_matrix, constraints_max_value, None, None, lb=constraints[:, 0], ub=constraints[:, 1], solver='quadprog', verbose=True)
+        optim_result = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), constraint_matrix, constraints_max_value, None, None, solver='quadprog', verbose=True)
+
+        # in extreme cases, the prior solver works better
+        # for some reason, the posterior one doesn't work in the monotonic case where we have an almost constant stretch
+        # the constraint ends up being violated
+        optim_prior = solve_qp(np.linalg.inv(self.cov_prior), np.zeros(self.splines.n_splines), constraint_matrix, constraints_max_value, A, interpol_y, solver='quadprog', verbose=True)
+
+        print(optim_result.max(), optim_result.min())
+        if optim_prior is None:
+            print('Failed optim prior')
+        #assert optim_result.success, optim_result
+        self.mean_constrained = optim_result
+        self.mean_constrained_prior = optim_prior
+
+        # remove this
+        #self.mean_constrained = optim_prior
+        print('Optim posterior vs prior difference', np.abs(optim_result - optim_prior).max())
 
     """
         @param x_sample: points at which to return the sampled function. If x_sample is None, the original RV used to
                          represent this finite dimensional approximation to the GP are returned
     """
-    def sample_constrained(self, x_sample=None, n_samples = 1):
+    def sample_constrained(self, x_sample=None, n_samples = 1, return_stats=False, throw_exception_if_failed=True):
         assert self.mean_interpol is not None and self.cov_interpol is not None
         assert self.mean_constrained is not None
 
@@ -430,19 +452,20 @@ class MonotonicGP(constrainedGP):
             print(x_sample)
             phi_T = self.splines.eval_splines(x_sample)
         samples = np.zeros((n_samples, x_sample.shape[0]))
-        print(samples.shape)
         n_accepted = 0
         n_rejected = 0
+        n_rejected_constraint = 0
         for n_iter in range(100*n_samples):
             potential = np.random.multivariate_normal(self.mean_constrained, self.cov_interpol, n_samples)
 
             accepted_convex = np.all(np.logical_and(potential[:, 1:] > self.lowerbound, potential[:, 1:] < self.upperbound), axis=1)
-            print(accepted_convex.sum()) 
-            
+
+            n_rejected_constraint += n_samples - accepted_convex.sum()
             unif = np.random.uniform(size=n_samples)
             # Have to use cov_interpol, otherwise Neumann theorem doesn't apply and we can't sample from the original distribution in this way.
-            accepted_neumann_sampling = unif < np.exp(self.mean_constrained.T @ np.linalg.solve(self.cov_interpol, self.mean_constrained) - 
-                                   potential @ np.linalg.solve(self.cov_interpol, self.mean_constrained))
+            accepted_neumann_sampling = unif < np.exp((potential-self.mean_constrained.T) @ np.linalg.solve(self.cov_interpol, self.mean_interpol - self.mean_constrained))
+            #accepted_neumann_sampling = unif < np.exp(self.mean_constrained.T @ np.linalg.solve(self.cov_interpol, self.mean_constrained) - 
+            #                       potential @ np.linalg.solve(self.cov_interpol, self.mean_constrained))
             accepted = np.logical_and(accepted_convex, accepted_neumann_sampling)
             n_newly_accepted = min(accepted.sum(), n_samples-n_accepted)
             if x_sample is None:
@@ -450,10 +473,16 @@ class MonotonicGP(constrainedGP):
             else:
                 samples[n_accepted:n_accepted+n_newly_accepted, :] = potential[accepted, :][:n_newly_accepted] @ phi_T.T
 
-            n_accepted += n_newly_accepted
-            n_rejected += n_samples - n_newly_accepted
-            if n_accepted == n_samples:
+            n_accepted += accepted.sum()
+            n_rejected += n_samples - accepted.sum()
+            if n_accepted >= n_samples:
                 break
-        print('Accepted: %d; %.2f percent' % (n_accepted, 100.*n_accepted/(n_accepted+n_rejected)))
-        assert n_accepted == n_samples
-        return samples
+        print('Sampling %.2f%% (accepted); %.2f%% (Rejected, violated constraints); %.2f%% (Rejected, Neumann sampling)' % (100.*n_accepted/(n_accepted+n_rejected),\
+              100*n_rejected_constraint/(n_accepted+n_rejected), 100*(n_rejected-n_rejected_constraint)/(n_accepted+n_rejected)))
+        if throw_exception_if_failed:
+            assert n_accepted >= n_samples
+
+        if return_stats:
+            return samples[:n_accepted, :], {'n_rejected_constraint': n_rejected_constraint, 'n_rejected_neumann': n_rejected-n_rejected_constraint, 'n_accepted': n_accepted}
+        else:
+            return samples[:n_accepted, :]
