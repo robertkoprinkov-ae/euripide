@@ -20,12 +20,12 @@ class constrainedGP():
     - The type of truncation on the random variables \\xi, which depends on the role of the random variable, which is defined by its influence function \\phi_i
     """
 
-    def __init__(self, N_splines, x_min, x_max, kernel, interpol_x=None, interpol_y=None, lowerbound=None, upperbound=None):
+    def __init__(self, N_splines, x_min, x_max, kernel, interpol_x=None, interpol_y=None, lowerbound=None, upperbound=None, nugget_prior=1e-3, nugget_interpol=1e-6):
         self.splines = self.init_splines(N_splines, x_min, x_max)
 
         self.kernel = kernel
 
-        self.mean_prior, self.cov_prior = self.prior(nugget=1e-3)
+        self.mean_prior, self.cov_prior = self.prior(nugget=nugget_prior)
         
         self.interpol_x = interpol_x
         self.interpol_y = interpol_y
@@ -34,27 +34,24 @@ class constrainedGP():
         self.cov_interpol = None
         
         if self.interpol_x is not None:
-            self.mean_interpol, self.cov_interpol = self.calc_interpolation(interpol_x, interpol_y, nugget=1e-6)
+            self.mean_interpol, self.cov_interpol = self.calc_interpolation(interpol_x, interpol_y, nugget=nugget_interpol)
+         
+        if lowerbound is not None:
+            self.constraint_matrix, self.constraints_max_value = self.define_constraints(lowerbound, upperbound)
+            optim_result = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), self.constraint_matrix, self.constraints_max_value, None, None, solver='quadprog', verbose=True)
 
-        self.constraint_matrix, self.constraints_max_value = self.define_constraints(lowerbound, upperbound)
-        
-        self.lowerbound = lowerbound
-        self.upperbound = upperbound
-        
-        optim_result = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), self.constraint_matrix, self.constraints_max_value, None, None, solver='quadprog', verbose=True)
+            # in extreme cases, the prior solver works better
+            # for some reason, the posterior one doesn't work in the monotonic case where we have an almost constant stretch
+            # the constraint ends up being violated
+            A = self.splines.eval_splines(interpol_x)
+            optim_prior = solve_qp(np.linalg.inv(self.cov_prior), np.zeros(self.splines.n_splines), self.constraint_matrix, self.constraints_max_value, A, interpol_y, solver='quadprog', verbose=True)
 
-        # in extreme cases, the prior solver works better
-        # for some reason, the posterior one doesn't work in the monotonic case where we have an almost constant stretch
-        # the constraint ends up being violated
-        A = self.splines.eval_splines(interpol_x)
-        optim_prior = solve_qp(np.linalg.inv(self.cov_prior), np.zeros(self.splines.n_splines), self.constraint_matrix, self.constraints_max_value, A, interpol_y, solver='quadprog', verbose=True)
+            if optim_prior is None:
+                print('Failed optim prior')
+            self.mean_constrained = optim_result
+            self.mean_constrained_prior = optim_prior
 
-        if optim_prior is None:
-            print('Failed optim prior')
-        self.mean_constrained = optim_result
-        self.mean_constrained_prior = optim_prior
-
-        print('Optim posterior vs prior difference', np.abs(optim_result - optim_prior).max())
+            print('Optim posterior vs prior difference', np.abs(optim_result - optim_prior).max())
 
     """
         Return prior mean and covariance matrices. Must have same dimension as number of RV of representation.
@@ -90,7 +87,7 @@ class constrainedGP():
             print('[PosDef] Prior covariance matrix:', np.all(np.linalg.eigvals(self.cov_prior) > 0))
 
         if nugget is not None:
-            cov_noise = cov_interpol + 5e-3 * np.eye(self.splines.n_splines)# np.random.uniform(size=self.cov_interpol.shape)
+            cov_noise = cov_interpol + nugget * np.eye(self.splines.n_splines)# np.random.uniform(size=self.cov_interpol.shape)
             
             if verbose:
                 print('[Nugget] added to post-interpolation covariance matrix. Condition number went from %d to %d.' % (np.linalg.cond(cov_interpol), np.linalg.cond(cov_noise)))
