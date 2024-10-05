@@ -1,13 +1,14 @@
 import src.BoundedGP as BoundedGP
+import src.kernels as kernels
 import numpy as np
 import src.vis as vis
 
-lowerbound = -10.
+lowerbound = -15.
 upperbound = 20.
 
 interpol_x, interpol_y = np.array([0.0, 0.1, 0.19, 0.41, 0.52, 0.9]), np.array([10.0, 8., -9., -6., 12., 17.])
 
-kernel = BoundedGP.gaussian_kernel(params={'sigma': 25., 'theta': 0.2})
+kernel = kernels.gaussian_kernel(params={'sigma': 25., 'theta': 0.2})
 
 # this is going to be a problem, the knots. We will need an adaptive approach because we don't know a priori
 # how the knots will be distributed. Maybe even something like multigrid.

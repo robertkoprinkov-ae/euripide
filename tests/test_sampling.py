@@ -1,9 +1,9 @@
 import unittest
-from src.BoundedGP import hats as hats
-from src.BoundedGP import monotonic_splines as monotonic_splines
+from src.splines import hats as hats
+from src.splines import monotonic_splines as monotonic_splines
 
 from src.BoundedGP import BoundedGP
-from src.BoundedGP import gaussian_kernel
+from src.kernels import gaussian_kernel
 
 from src.vis import Visualize
 

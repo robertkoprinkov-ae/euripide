@@ -1,6 +1,6 @@
 import unittest
 from src.BoundedGP import hats as hats
-from src.BoundedGP import monotonic_splines as monotonic_splines
+from src.splines import monotonic_splines as monotonic_splines
 
 import numpy as np
 
