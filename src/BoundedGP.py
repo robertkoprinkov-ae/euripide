@@ -35,11 +35,37 @@ class constrainedGP():
         
         if self.interpol_x is not None:
             self.mean_interpol, self.cov_interpol = self.calc_interpolation(interpol_x, interpol_y, nugget=nugget_interpol)
-         
+
+            _, cov_no_nugget = self.calc_interpolation(interpol_x, interpol_y, nugget=None)
+            eigv, eigvec = np.linalg.eigh(cov_no_nugget)
+
+            nonzero = np.abs(eigv) > 1e-9
+            self.map_from_reduced = eigvec.T
+            
+            eigv = eigv[nonzero]
+            eigvec = eigvec[nonzero]
+            self.map_from_reduced = self.map_from_reduced[:, nonzero]
+            
+            print(eigvec.shape)
+            self.cov_interpol_reduced_old = np.diag(eigv) @ (eigvec @ eigvec.T)
+            self.cov_interpol_reduced = self.map_from_reduced.T @ cov_no_nugget @ self.map_from_reduced
+
+            print(np.abs(self.cov_interpol_reduced - self.cov_interpol_reduced.T).max(), 'Diff symmetry')
+            self.cov_interpol_reduced = .5 * self.cov_interpol_reduced + .5*self.cov_interpol_reduced.T
+            print(np.linalg.eigvals(self.cov_interpol_reduced).real.min())
+            # TODO: they should be the same
+            print(np.abs(self.cov_interpol_reduced - self.cov_interpol_reduced_old).max())
         if lowerbound is not None:
             self.constraint_matrix, self.constraints_max_value = self.define_constraints(lowerbound, upperbound)
+            optim_result_shifted = self.mean_interpol + solve_qp(np.linalg.inv(self.cov_interpol), np.zeros(self.splines.n_splines), self.constraint_matrix, self.constraints_max_value - self.constraint_matrix @ self.mean_interpol, None, None, solver='quadprog', verbose=True)
             optim_result = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), self.constraint_matrix, self.constraints_max_value, None, None, solver='quadprog', verbose=True)
 
+            red_inv = np.linalg.inv(self.cov_interpol_reduced)
+            red_inv = .5*(red_inv + red_inv.T)
+            optim_red = self.mean_interpol + self.map_from_reduced @ solve_qp(red_inv, np.zeros(self.cov_interpol_reduced.shape[0]), self.constraint_matrix @ self.map_from_reduced, self.constraints_max_value - self.constraint_matrix @ self.mean_interpol, None, None, solver='quadprog', verbose=True)
+            # shifted gets the same result
+            print('Max diff', np.abs(optim_result - optim_result_shifted).max(), np.abs(optim_red - optim_result_shifted).max())
+            print(optim_red)
             # in extreme cases, the prior solver works better
             # for some reason, the posterior one doesn't work in the monotonic case where we have an almost constant stretch
             # the constraint ends up being violated
@@ -173,10 +199,8 @@ class constrainedGP():
         n_rejected_constraint = 0
         for n_iter in range(100*n_samples):
             potential = np.random.multivariate_normal(self.mean_constrained, self.cov_interpol, n_samples)
-
-            accepted_convex = np.all(np.logical_and(potential[:, 1:] > self.lowerbound, potential[:, 1:] < self.upperbound), axis=1)
-            
-            accepted_convex_new = np.all(potential @ self.constraint_matrix.T < self.constraints_max_value, axis=1)
+          
+            accepted_convex = np.all(potential @ self.constraint_matrix.T < self.constraints_max_value, axis=1)
             
             n_rejected_constraint += n_samples - accepted_convex.sum()
             unif = np.random.uniform(size=n_samples)
