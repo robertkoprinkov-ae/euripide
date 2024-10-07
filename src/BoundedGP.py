@@ -3,6 +3,7 @@ import scipy
 from qpsolvers import solve_qp
 
 from . import splines as splines
+from .minimax_tilting_sampler import TruncatedMVN
 
 class constrainedGP():
     """
@@ -57,15 +58,15 @@ class constrainedGP():
             print(np.abs(self.cov_interpol_reduced - self.cov_interpol_reduced_old).max())
         if lowerbound is not None:
             self.constraint_matrix, self.constraints_max_value = self.define_constraints(lowerbound, upperbound)
-            optim_result_shifted = self.mean_interpol + solve_qp(np.linalg.inv(self.cov_interpol), np.zeros(self.splines.n_splines), self.constraint_matrix, self.constraints_max_value - self.constraint_matrix @ self.mean_interpol, None, None, solver='quadprog', verbose=True)
+            #optim_result_shifted = self.mean_interpol + solve_qp(np.linalg.inv(self.cov_interpol), np.zeros(self.splines.n_splines), self.constraint_matrix, self.constraints_max_value - self.constraint_matrix @ self.mean_interpol, None, None, solver='quadprog', verbose=True)
             optim_result = solve_qp(np.linalg.inv(self.cov_interpol), -self.mean_interpol.T @ np.linalg.inv(self.cov_interpol), self.constraint_matrix, self.constraints_max_value, None, None, solver='quadprog', verbose=True)
 
-            red_inv = np.linalg.inv(self.cov_interpol_reduced)
-            red_inv = .5*(red_inv + red_inv.T)
-            optim_red = self.mean_interpol + self.map_from_reduced @ solve_qp(red_inv, np.zeros(self.cov_interpol_reduced.shape[0]), self.constraint_matrix @ self.map_from_reduced, self.constraints_max_value - self.constraint_matrix @ self.mean_interpol, None, None, solver='quadprog', verbose=True)
+            #red_inv = np.linalg.inv(self.cov_interpol_reduced)
+            #red_inv = .5*(red_inv + red_inv.T)
+            #optim_red = self.mean_interpol + self.map_from_reduced @ solve_qp(red_inv, np.zeros(self.cov_interpol_reduced.shape[0]), self.constraint_matrix @ self.map_from_reduced, self.constraints_max_value - self.constraint_matrix @ self.mean_interpol, None, None, solver='quadprog', verbose=True)
             # shifted gets the same result
-            print('Max diff', np.abs(optim_result - optim_result_shifted).max(), np.abs(optim_red - optim_result_shifted).max())
-            print(optim_red)
+            #print('Max diff', np.abs(optim_result - optim_result_shifted).max(), np.abs(optim_red - optim_result_shifted).max())
+            #print(optim_red)
             # in extreme cases, the prior solver works better
             # for some reason, the posterior one doesn't work in the monotonic case where we have an almost constant stretch
             # the constraint ends up being violated
@@ -79,6 +80,8 @@ class constrainedGP():
 
             print('Optim posterior vs prior difference', np.abs(optim_result - optim_prior).max())
 
+            lb, ub = self.get_bounds(lowerbound, upperbound)
+            self.ET_sampler = TruncatedMVN(self.mean_interpol, self.cov_interpol, lb, ub)
     """
         Return prior mean and covariance matrices. Must have same dimension as number of RV of representation.
     """
@@ -92,7 +95,13 @@ class constrainedGP():
     """
     def define_constraints(self):
         pass
-    
+
+    """
+        Return the bounds for the RV. Returns two np.arrays, both of size self.splines.n_splines, one specifying the lowerbound
+        of each RV in the internal representation, the other representing the upper bounds.
+    """
+    def get_bounds(self, lowerbound, upperbound):
+        pass
     """
         Return the splines that will be used in this representation
     """
@@ -228,7 +237,26 @@ class constrainedGP():
             return samples[:n_accepted, :], {'n_rejected_constraint': n_rejected_constraint, 'n_rejected_neumann': n_rejected-n_rejected_constraint, 'n_accepted': n_accepted}
         else:
             return samples[:n_accepted, :]
-    
+    """
+        @param x_sample: points at which to return the sampled function. If x_sample is None, the original RV used to
+                         represent this finite dimensional approximation to the GP are returned
+    """
+    def sample_constrained_ET(self, x_sample=None, n_samples = 1, return_stats=False, throw_exception_if_failed=True):
+        assert self.mean_interpol is not None and self.cov_interpol is not None
+        assert self.mean_constrained is not None
+
+        phi_T = None
+        if x_sample is not None:
+            phi_T = self.splines.eval_splines(x_sample)
+        samples = self.ET_sampler.sample(1000*n_samples)
+        samples = samples[:, -10*n_samples:]
+        permutation = np.random.permutation(samples.shape[1])
+        samples = samples[:, permutation].T
+
+        if x_sample is not None:
+            samples = samples @ phi_T.T
+        return samples
+        
     """
         Evaluate a given realization of the RV xi at new points x_eval
         
@@ -262,6 +290,9 @@ class BoundedGP(constrainedGP):
         constraints_max_value[self.splines.n_splines:] = -lowerbound
         
         return constraint_matrix, constraints_max_value
+
+    def get_bounds(self, lowerbound, upperbound):
+        return lowerbound*np.ones(self.splines.n_splines), upperbound*np.ones(self.splines.n_splines)
     
     def init_splines(self, N_splines, x_min, x_max):
         return splines.hats(N_splines, x_min, x_max)
@@ -305,3 +336,13 @@ class MonotonicGP(constrainedGP):
         
         return constraint_matrix, constraints_max_value
 
+    def get_bounds(self, lowerbound, upperbound):
+        lb = np.ones(self.splines.n_splines)
+        ub = np.ones(self.splines.n_splines)
+
+        lb[0] = -1e-9
+        ub[0] = 1e9
+
+        lb[1:] = lowerbound
+        ub[1:] = upperbound
+        return lb, ub

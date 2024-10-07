@@ -50,7 +50,9 @@ class Visualize():
         y_sample = []
         
         if n_samples is not None:
-            samples = boundedGP.sample_constrained(x_sample=boundedGP.splines.splines_x, n_samples=n_samples)
+            #samples = boundedGP.sample_constrained(x_sample=boundedGP.splines.splines_x, n_samples=n_samples)
+            samples = boundedGP.sample_constrained_ET(x_sample=boundedGP.splines.splines_x, n_samples=n_samples)
+            
             for i in range(n_samples):
                 y_sample.append(ax[0].plot(boundedGP.splines.splines_x, samples[i], color='red', linestyle='-', linewidth=0.2, alpha=0.1)[0])
         

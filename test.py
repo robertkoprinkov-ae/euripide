@@ -19,6 +19,8 @@ mean_knots, var_knots = boundedGP.statistics_prior()
 
 mean, var = boundedGP.statistics_interpolation()
 
+boundedGP.sample_constrained_ET(x_sample=boundedGP.splines.splines_x)
+
 visualize = vis.Visualize()
 
 visualize.visualize_optim_methods(boundedGP)
